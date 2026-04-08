@@ -294,24 +294,36 @@ mod impls {
         }
     }
 
-    /// Trace 系统调用实现（练习题需要完成的部分）
-    ///
-    /// 当前为占位实现，返回 -1 表示未实现。
-    /// 学生需要在练习中实现 trace 功能，支持：
-    /// - 读取用户内存（trace_request=0）
-    /// - 写入用户内存（trace_request=1）
-    /// - 查询系统调用计数（trace_request=2）
+    /// Trace 系统调用实现
     impl Trace for SyscallContext {
         #[inline]
         fn trace(
             &self,
-            _caller: Caller,
-            _trace_request: usize,
-            _id: usize,
-            _data: usize,
+            caller: Caller,
+            trace_request: usize,
+            id: usize,
+            data: usize,
         ) -> isize {
-            tg_console::log::info!("trace: not implemented");
-            -1
+            // 通过 caller.entity 传递 TCB 指针
+            let tcb = unsafe { &mut *(caller.entity as *mut crate::task::TaskControlBlock) };
+            match trace_request {
+                // 读取用户内存地址 id 处的一个字节
+                0 => unsafe { *(id as *const u8) as isize },
+                // 写入 data 的最低字节到用户内存地址 id 处
+                1 => {
+                    unsafe { *(id as *mut u8) = data as u8 };
+                    0
+                }
+                // 查询 syscall id 的调用次数（本次调用已在 handle_syscall 中计入）
+                2 => {
+                    if id < 512 {
+                        tcb.syscall_counts[id] as isize
+                    } else {
+                        0
+                    }
+                }
+                _ => -1,
+            }
         }
     }
 }

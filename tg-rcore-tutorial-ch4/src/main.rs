@@ -555,34 +555,55 @@ mod impls {
         }
     }
 
-    /// Trace 系统调用实现（练习题需要完成的部分）
-    ///
-    /// 引入虚存机制后，原来的 trace 实现无效了，需要：
-    /// - 读取时检查用户地址是否可见且可读
-    /// - 写入时检查用户地址是否可见且可写
-    /// - 使用 translate() 方法进行地址翻译和权限检查
+    /// Trace 系统调用实现（ch4：带地址翻译和权限检查）
     impl Trace for SyscallContext {
         #[inline]
         fn trace(
             &self,
-            _caller: Caller,
-            _trace_request: usize,
-            _id: usize,
-            _data: usize,
+            caller: Caller,
+            trace_request: usize,
+            id: usize,
+            data: usize,
         ) -> isize {
-            tg_console::log::info!("trace: not implemented");
-            -1
+            let process = unsafe { PROCESSES.get_mut() }
+                .get_mut(caller.entity)
+                .unwrap();
+            match trace_request {
+                // 读取用户地址 id 处的一个字节（需可读）
+                0 => {
+                    const READABLE: VmFlags<Sv39> = build_flags("RV");
+                    if let Some(ptr) = process
+                        .address_space
+                        .translate::<u8>(VAddr::new(id), READABLE)
+                    {
+                        unsafe { *ptr.as_ptr() as isize }
+                    } else {
+                        -1
+                    }
+                }
+                // 写入 data 最低字节到用户地址 id 处（需可写）
+                1 => {
+                    const WRITABLE: VmFlags<Sv39> = build_flags("W_V");
+                    if let Some(mut ptr) = process
+                        .address_space
+                        .translate::<u8>(VAddr::new(id), WRITABLE)
+                    {
+                        unsafe { *ptr.as_mut() = data as u8 };
+                        0
+                    } else {
+                        -1
+                    }
+                }
+                _ => -1,
+            }
         }
     }
 
-    /// Memory 系统调用实现（练习题需要完成的部分）
-    ///
-    /// - `mmap`：将物理内存映射到用户虚拟地址空间
-    /// - `munmap`：取消虚拟内存映射
+    /// Memory 系统调用实现（mmap/munmap）
     impl Memory for SyscallContext {
         fn mmap(
             &self,
-            _caller: Caller,
+            caller: Caller,
             addr: usize,
             len: usize,
             prot: i32,
@@ -590,15 +611,50 @@ mod impls {
             _fd: i32,
             _offset: usize,
         ) -> isize {
-            tg_console::log::info!(
-                "mmap: addr = {addr:#x}, len = {len}, prot = {prot}, not implemented"
-            );
-            -1
+            // addr 必须页对齐
+            if addr & ((1 << Sv39::PAGE_BITS) - 1) != 0 {
+                return -1;
+            }
+            // prot 高位必须为 0，且至少有一个权限位
+            if prot & !0b111 != 0 {
+                return -1;
+            }
+            if len == 0 {
+                return 0;
+            }
+            let process = unsafe { PROCESSES.get_mut() }
+                .get_mut(caller.entity)
+                .unwrap();
+
+            // 构建权限标志：U + 用户指定的 RWX
+            let mut flags_str = [b'U', b'_', b'_', b'_', b'V'];
+            if prot & 0b100 != 0 { flags_str[3] = b'R'; }
+            if prot & 0b010 != 0 { flags_str[2] = b'W'; }
+            if prot & 0b001 != 0 { flags_str[1] = b'X'; }
+            let flags = parse_flags(
+                unsafe { core::str::from_utf8_unchecked(&flags_str) }
+            ).unwrap_or(build_flags("U_WRV"));
+
+            let start = VAddr::<Sv39>::new(addr).floor();
+            let end = VAddr::<Sv39>::new(addr + len).ceil();
+            process.address_space.map(start..end, &[], 0, flags);
+            0
         }
 
-        fn munmap(&self, _caller: Caller, addr: usize, len: usize) -> isize {
-            tg_console::log::info!("munmap: addr = {addr:#x}, len = {len}, not implemented");
-            -1
+        fn munmap(&self, caller: Caller, addr: usize, len: usize) -> isize {
+            if addr & ((1 << Sv39::PAGE_BITS) - 1) != 0 {
+                return -1;
+            }
+            if len == 0 {
+                return 0;
+            }
+            let process = unsafe { PROCESSES.get_mut() }
+                .get_mut(caller.entity)
+                .unwrap();
+            let start = VAddr::<Sv39>::new(addr).floor();
+            let end = VAddr::<Sv39>::new(addr + len).ceil();
+            process.address_space.unmap(start..end);
+            0
         }
     }
 }
