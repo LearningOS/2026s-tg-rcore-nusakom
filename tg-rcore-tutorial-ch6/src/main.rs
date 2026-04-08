@@ -580,35 +580,87 @@ mod impls {
         }
 
         /// linkat 系统调用：创建硬链接
-        ///
-        /// TODO: 实现 linkat 系统调用（练习题）
         fn linkat(
             &self,
             _caller: Caller,
             _olddirfd: i32,
-            _oldpath: usize,
+            oldpath: usize,
             _newdirfd: i32,
-            _newpath: usize,
+            newpath: usize,
             _flags: u32,
         ) -> isize {
-            tg_console::log::info!("linkat: not implemented");
-            -1
+            let current = PROCESSOR.get_mut().current().unwrap();
+            let read_path = |addr: usize| -> Option<alloc::string::String> {
+                current.address_space.translate(VAddr::new(addr), READABLE).map(|ptr| {
+                    let mut s = alloc::string::String::new();
+                    let mut raw_ptr: *mut u8 = ptr.as_ptr();
+                    loop {
+                        unsafe {
+                            let ch = *raw_ptr;
+                            if ch == 0 { break; }
+                            s.push(ch as char);
+                            raw_ptr = (raw_ptr as usize + 1) as *mut u8;
+                        }
+                    }
+                    s
+                })
+            };
+            let old = match read_path(oldpath) { Some(s) => s, None => return -1 };
+            let new = match read_path(newpath) { Some(s) => s, None => return -1 };
+            if old == new { return -1; }
+            FS.link(old.as_str(), new.as_str())
         }
 
         /// unlinkat 系统调用：删除硬链接
-        ///
-        /// TODO: 实现 unlinkat 系统调用（练习题）
-        fn unlinkat(&self, _caller: Caller, _dirfd: i32, _path: usize, _flags: u32) -> isize {
-            tg_console::log::info!("unlinkat: not implemented");
-            -1
+        fn unlinkat(&self, _caller: Caller, _dirfd: i32, path: usize, _flags: u32) -> isize {
+            let current = PROCESSOR.get_mut().current().unwrap();
+            if let Some(ptr) = current.address_space.translate(VAddr::new(path), READABLE) {
+                let mut s = alloc::string::String::new();
+                let mut raw_ptr: *mut u8 = ptr.as_ptr();
+                loop {
+                    unsafe {
+                        let ch = *raw_ptr;
+                        if ch == 0 { break; }
+                        s.push(ch as char);
+                        raw_ptr = (raw_ptr as usize + 1) as *mut u8;
+                    }
+                }
+                FS.unlink(s.as_str())
+            } else {
+                -1
+            }
         }
 
         /// fstat 系统调用：获取文件状态
-        ///
-        /// TODO: 实现 fstat 系统调用（练习题）
-        fn fstat(&self, _caller: Caller, _fd: usize, _st: usize) -> isize {
-            tg_console::log::info!("fstat: not implemented");
-            -1
+        fn fstat(&self, _caller: Caller, fd: usize, st: usize) -> isize {
+            let current = PROCESSOR.get_mut().current().unwrap();
+            if fd >= current.fd_table.len() {
+                return -1;
+            }
+            let inode = match &current.fd_table[fd] {
+                Some(file) => {
+                    let file = file.lock();
+                    match &file.inode {
+                        Some(inode) => inode.clone(),
+                        None => return -1,
+                    }
+                }
+                None => return -1,
+            };
+            if let Some(mut ptr) = current
+                .address_space
+                .translate::<Stat>(VAddr::new(st), WRITEABLE)
+            {
+                let mut stat = Stat::new();
+                stat.dev = 0;
+                stat.ino = inode.inode_id() as u64;
+                stat.mode = StatMode::FILE;
+                stat.nlink = inode.nlink();
+                unsafe { *ptr.as_mut() = stat; }
+                0
+            } else {
+                -1
+            }
         }
     }
 
@@ -693,14 +745,37 @@ mod impls {
             current.pid.get_usize() as _
         }
 
-        /// spawn 系统调用（TODO 练习题）
-        fn spawn(&self, _caller: Caller, _path: usize, _count: usize) -> isize {
-            let current = PROCESSOR.get_mut().current().unwrap();
-            tg_console::log::info!(
-                "spawn: parent pid = {}, not implemented",
-                current.pid.get_usize()
-            );
-            -1
+        /// spawn 系统调用：从文件系统创建新进程
+        fn spawn(&self, _caller: Caller, path: usize, count: usize) -> isize {
+            const READABLE: VmFlags<Sv39> = build_flags("RV");
+            let processor: *mut PManager<ProcStruct, ProcManager> = PROCESSOR.get_mut() as *mut _;
+            let current = unsafe { (*processor).current().unwrap() };
+            let parent_pid = current.pid;
+            // 读取程序名
+            let name_opt = current
+                .address_space
+                .translate::<u8>(VAddr::new(path), READABLE)
+                .map(|ptr| unsafe {
+                    core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr.as_ptr(), count))
+                })
+                .and_then(|name| FS.open(name, OpenFlags::RDONLY));
+            let fd = match name_opt {
+                Some(fd) => fd,
+                None => { log::error!("spawn: app not found"); return -1; }
+            };
+            let data = read_all(fd);
+            let elf = match ElfFile::new(&data) {
+                Ok(e) => e,
+                Err(_) => { log::error!("spawn: invalid elf"); return -1; }
+            };
+            match ProcStruct::from_elf(elf) {
+                Some(child_proc) => {
+                    let pid = child_proc.pid;
+                    unsafe { (*processor).add(pid, child_proc, parent_pid) };
+                    pid.get_usize() as isize
+                }
+                None => { log::error!("spawn: from_elf failed"); -1 }
+            }
         }
 
         /// sbrk 系统调用：调整堆大小
@@ -721,15 +796,14 @@ mod impls {
             0
         }
 
-        /// set_priority 系统调用（TODO 练习题）
+        /// set_priority 系统调用
         fn set_priority(&self, _caller: Caller, prio: isize) -> isize {
+            if prio < 2 {
+                return -1;
+            }
             let current = PROCESSOR.get_mut().current().unwrap();
-            tg_console::log::info!(
-                "set_priority: pid = {}, prio = {}, not implemented",
-                current.pid.get_usize(),
-                prio
-            );
-            -1
+            current.priority = prio as usize;
+            prio
         }
     }
 
@@ -765,7 +839,7 @@ mod impls {
 
     /// 内存管理系统调用实现
     impl Memory for SyscallContext {
-        /// mmap 系统调用（TODO 练习题）
+        /// mmap 系统调用：映射匿名内存
         fn mmap(
             &self,
             _caller: Caller,
@@ -776,16 +850,42 @@ mod impls {
             _fd: i32,
             _offset: usize,
         ) -> isize {
-            tg_console::log::info!(
-                "mmap: addr = {addr:#x}, len = {len}, prot = {prot}, not implemented"
-            );
-            -1
+            if addr & ((1 << Sv39::PAGE_BITS) - 1) != 0 {
+                return -1;
+            }
+            if prot & !0b111 != 0 {
+                return -1;
+            }
+            if len == 0 {
+                return 0;
+            }
+            let current = PROCESSOR.get_mut().current().unwrap();
+            let mut flags_str = [b'U', b'_', b'_', b'_', b'V'];
+            if prot & 0b100 != 0 { flags_str[3] = b'R'; }
+            if prot & 0b010 != 0 { flags_str[2] = b'W'; }
+            if prot & 0b001 != 0 { flags_str[1] = b'X'; }
+            let flags = unsafe { core::str::from_utf8_unchecked(&flags_str) }
+                .parse::<VmFlags<Sv39>>()
+                .unwrap_or(build_flags("U_WRV"));
+            let start = VAddr::<Sv39>::new(addr).floor();
+            let end = VAddr::<Sv39>::new(addr + len).ceil();
+            current.address_space.map(start..end, &[], 0, flags);
+            0
         }
 
-        /// munmap 系统调用（TODO 练习题）
+        /// munmap 系统调用：取消内存映射
         fn munmap(&self, _caller: Caller, addr: usize, len: usize) -> isize {
-            tg_console::log::info!("munmap: addr = {addr:#x}, len = {len}, not implemented");
-            -1
+            if addr & ((1 << Sv39::PAGE_BITS) - 1) != 0 {
+                return -1;
+            }
+            if len == 0 {
+                return 0;
+            }
+            let current = PROCESSOR.get_mut().current().unwrap();
+            let start = VAddr::<Sv39>::new(addr).floor();
+            let end = VAddr::<Sv39>::new(addr + len).ceil();
+            current.address_space.unmap(start..end);
+            0
         }
     }
 }

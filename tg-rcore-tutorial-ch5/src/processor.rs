@@ -23,7 +23,7 @@
 //! - 最后结合 `ch5/src/main.rs` 中对 `PROCESSOR` 的调用观察状态流转。
 
 use crate::process::Process;
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::BTreeMap;
 use core::cell::UnsafeCell;
 use tg_task_manage::{Manage, PManager, ProcId, Schedule};
 
@@ -59,14 +59,12 @@ pub static PROCESSOR: Processor = Processor::new();
 ///
 /// 负责管理所有进程实体和调度队列：
 /// - `tasks`：以 ProcId 为键的进程映射表，存储所有进程实体
-/// - `ready_queue`：就绪队列，存储等待执行的进程 PID
-///
-/// 当前使用 FIFO/RR 调度策略。练习题要求改为 stride 调度算法。
+/// - `ready_queue`：就绪队列，存储等待执行的进程 PID（stride 调度）
 pub struct ProcManager {
     /// 所有进程实体的映射表
     tasks: BTreeMap<ProcId, Process>,
-    /// 就绪队列（FIFO 调度）
-    ready_queue: VecDeque<ProcId>,
+    /// 就绪队列（stride 调度，存储 PID）
+    ready_queue: alloc::vec::Vec<ProcId>,
 }
 
 impl ProcManager {
@@ -74,7 +72,7 @@ impl ProcManager {
     pub fn new() -> Self {
         Self {
             tasks: BTreeMap::new(),
-            ready_queue: VecDeque::new(),
+            ready_queue: alloc::vec::Vec::new(),
         }
     }
 }
@@ -100,15 +98,33 @@ impl Manage<Process, ProcId> for ProcManager {
     }
 }
 
-/// 实现 Schedule trait：进程调度（当前为 FIFO/RR）
+/// 实现 Schedule trait：stride 调度算法
 impl Schedule<ProcId> for ProcManager {
-    /// 将进程加入就绪队列尾部
+    /// 将进程加入就绪队列
     fn add(&mut self, id: ProcId) {
-        self.ready_queue.push_back(id);
+        self.ready_queue.push(id);
     }
 
-    /// 从就绪队列头部取出下一个要执行的进程
+    /// 从就绪队列中选出 stride 最小的进程
     fn fetch(&mut self) -> Option<ProcId> {
-        self.ready_queue.pop_front()
+        if self.ready_queue.is_empty() {
+            return None;
+        }
+        // 找到 stride 最小的进程索引
+        let idx = self.ready_queue
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, pid)| {
+                self.tasks.get(pid).map(|p| p.stride).unwrap_or(0)
+            })
+            .map(|(i, _)| i)?;
+        let pid = self.ready_queue.remove(idx);
+        // 更新该进程的 stride
+        if let Some(proc) = self.tasks.get_mut(&pid) {
+            use crate::process::BIG_STRIDE;
+            let pass = BIG_STRIDE / proc.priority;
+            proc.stride = proc.stride.wrapping_add(pass);
+        }
+        Some(pid)
     }
 }

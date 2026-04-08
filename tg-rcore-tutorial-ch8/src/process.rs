@@ -84,9 +84,78 @@ pub struct Process {
     pub mutex_list: Vec<Option<Arc<dyn MutexTrait>>>,
     /// 条件变量列表（**本章新增**，所有线程共享）
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// 死锁检测开关
+    pub deadlock_detect_enabled: bool,
+    /// 银行家算法：mutex 可用资源向量（每个 mutex 1 个资源）
+    pub mutex_available: Vec<usize>,
+    /// 银行家算法：mutex 分配矩阵 [tid_idx][mutex_id]
+    pub mutex_allocation: Vec<Vec<usize>>,
+    /// 银行家算法：mutex 需求矩阵 [tid_idx][mutex_id]
+    pub mutex_need: Vec<Vec<usize>>,
+    /// 银行家算法：semaphore 可用资源向量
+    pub sem_available: Vec<usize>,
+    /// 银行家算法：semaphore 分配矩阵 [tid_idx][sem_id]
+    pub sem_allocation: Vec<Vec<usize>>,
+    /// 银行家算法：semaphore 需求矩阵 [tid_idx][sem_id]
+    pub sem_need: Vec<Vec<usize>>,
 }
 
 impl Process {
+    /// 银行家算法安全性检测（对 mutex 或 semaphore）
+    ///
+    /// 返回 true 表示安全（可以分配），false 表示不安全（会死锁）。
+    pub fn banker_check(
+        available: &[usize],
+        allocation: &[Vec<usize>],
+        need: &[Vec<usize>],
+    ) -> bool {
+        let n = allocation.len();
+        let m = available.len();
+        if n == 0 || m == 0 { return true; }
+        let mut work: Vec<usize> = available.to_vec();
+        let mut finish = vec![false; n];
+        loop {
+            let mut found = false;
+            for i in 0..n {
+                if finish[i] { continue; }
+                let can = (0..m).all(|j| {
+                    if j < need[i].len() { need[i][j] <= work[j] } else { true }
+                });
+                if can {
+                    for j in 0..m {
+                        if j < allocation[i].len() { work[j] += allocation[i][j]; }
+                    }
+                    finish[i] = true;
+                    found = true;
+                }
+            }
+            if !found { break; }
+        }
+        finish.iter().all(|&f| f)
+    }
+
+    /// 确保 mutex 银行家矩阵有足够的行（线程数）和列（mutex 数）
+    pub fn ensure_mutex_matrix(&mut self, tid_idx: usize, mutex_id: usize) {
+        let n = tid_idx + 1;
+        let m = mutex_id + 1;
+        while self.mutex_available.len() < m { self.mutex_available.push(1); }
+        while self.mutex_allocation.len() < n { self.mutex_allocation.push(vec![0; m]); }
+        while self.mutex_need.len() < n { self.mutex_need.push(vec![0; m]); }
+        for row in self.mutex_allocation.iter_mut() { while row.len() < m { row.push(0); } }
+        for row in self.mutex_need.iter_mut() { while row.len() < m { row.push(0); } }
+    }
+
+    /// 确保 semaphore 银行家矩阵有足够的行和列
+    pub fn ensure_sem_matrix(&mut self, tid_idx: usize, sem_id: usize, initial: usize) {
+        let n = tid_idx + 1;
+        let m = sem_id + 1;
+        while self.sem_available.len() < m { self.sem_available.push(initial); }
+        while self.sem_allocation.len() < n { self.sem_allocation.push(vec![0; m]); }
+        while self.sem_need.len() < n { self.sem_need.push(vec![0; m]); }
+        for row in self.sem_allocation.iter_mut() { while row.len() < m { row.push(0); } }
+        for row in self.sem_need.iter_mut() { while row.len() < m { row.push(0); } }
+    }
+
     /// exec：替换当前进程的地址空间和主线程上下文
     ///
     /// 注意：只支持单线程进程执行 exec
@@ -134,6 +203,13 @@ impl Process {
                 semaphore_list: Vec::new(),
                 mutex_list: Vec::new(),
                 condvar_list: Vec::new(),
+                deadlock_detect_enabled: false,
+                mutex_available: Vec::new(),
+                mutex_allocation: Vec::new(),
+                mutex_need: Vec::new(),
+                sem_available: Vec::new(),
+                sem_allocation: Vec::new(),
+                sem_need: Vec::new(),
             },
             thread,
         ))
@@ -206,6 +282,13 @@ impl Process {
                 semaphore_list: Vec::new(),
                 mutex_list: Vec::new(),
                 condvar_list: Vec::new(),
+                deadlock_detect_enabled: false,
+                mutex_available: Vec::new(),
+                mutex_allocation: Vec::new(),
+                mutex_need: Vec::new(),
+                sem_available: Vec::new(),
+                sem_allocation: Vec::new(),
+                sem_need: Vec::new(),
             },
             thread,
         ))

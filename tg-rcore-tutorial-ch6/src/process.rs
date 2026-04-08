@@ -45,17 +45,15 @@ pub struct Process {
     /// 进程的独立地址空间
     pub address_space: AddressSpace<Sv39, Sv39Manager>,
     /// 文件描述符表
-    ///
-    /// 每个 fd 对应一个 `Option<Mutex<FileHandle>>`：
-    /// - `Some(...)`: 有效的文件句柄
-    /// - `None`: 该 fd 已关闭或未使用
-    ///
-    /// 预留 fd 0/1/2 分别为 stdin/stdout/stderr。
     pub fd_table: Vec<Option<Mutex<FileHandle>>>,
     /// 堆底地址
     pub heap_bottom: usize,
     /// 当前程序 break 位置（堆顶）
     pub program_brk: usize,
+    /// stride 调度：当前累计步长
+    pub stride: usize,
+    /// stride 调度：进程优先级（>= 2）
+    pub priority: usize,
 }
 
 impl Process {
@@ -100,6 +98,8 @@ impl Process {
             fd_table: new_fd_table,
             heap_bottom: self.heap_bottom,
             program_brk: self.program_brk,
+            stride: 0,
+            priority: 16,
         })
     }
 
@@ -193,6 +193,8 @@ impl Process {
             ],
             heap_bottom,
             program_brk: heap_bottom,
+            stride: 0,
+            priority: 16,
         })
     }
 

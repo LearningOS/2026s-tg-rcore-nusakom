@@ -13,7 +13,8 @@ pub struct EasyFileSystem {
     pub inode_bitmap: Bitmap,
     ///Data bitmap
     pub data_bitmap: Bitmap,
-    inode_area_start_block: u32,
+    /// inode 区域起始块号
+    pub inode_area_start_block: u32,
     data_area_start_block: u32,
 }
 

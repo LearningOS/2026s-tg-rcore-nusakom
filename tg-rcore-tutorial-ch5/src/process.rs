@@ -34,6 +34,9 @@ use xmas_elf::{
     program, ElfFile,
 };
 
+/// stride 调度算法的大步长常数
+pub const BIG_STRIDE: usize = 1 << 20;
+
 /// 进程结构体
 ///
 /// 每个进程拥有独立的地址空间和执行上下文。
@@ -50,6 +53,10 @@ pub struct Process {
     pub heap_bottom: usize,
     /// 当前程序 break 位置（堆顶），通过 sbrk 调整
     pub program_brk: usize,
+    /// stride 调度：当前已运行的累计步长
+    pub stride: usize,
+    /// stride 调度：进程优先级（>= 2），pass = BIG_STRIDE / priority
+    pub priority: usize,
 }
 
 impl Process {
@@ -63,6 +70,7 @@ impl Process {
         self.context = proc.context;
         self.heap_bottom = proc.heap_bottom;
         self.program_brk = proc.program_brk;
+        // 保留 stride 和 priority 不变
     }
 
     /// fork 系统调用的核心实现：复制当前进程创建子进程
@@ -89,6 +97,8 @@ impl Process {
             address_space,
             heap_bottom: self.heap_bottom,
             program_brk: self.program_brk,
+            stride: 0,
+            priority: 16,
         })
     }
 
@@ -192,6 +202,8 @@ impl Process {
             address_space,
             heap_bottom,
             program_brk: heap_bottom,
+            stride: 0,
+            priority: 16,
         })
     }
 

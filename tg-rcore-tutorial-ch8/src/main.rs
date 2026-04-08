@@ -729,16 +729,49 @@ mod impls {
                 current_proc.semaphore_list.push(Some(Arc::new(Semaphore::new(res_count))));
                 current_proc.semaphore_list.len() - 1
             };
+            // 同步银行家算法 available 向量
+            let sem_id = id;
+            while current_proc.sem_available.len() <= sem_id {
+                current_proc.sem_available.push(0);
+            }
+            current_proc.sem_available[sem_id] = res_count;
             id as isize
         }
 
         /// V 操作：释放信号量，唤醒等待线程
         fn semaphore_up(&self, _caller: Caller, sem_id: usize) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
+            let current = unsafe { (*processor).current().unwrap() };
+            let tid = current.tid;
             let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
+            // 更新银行家算法：释放资源
+            if current_proc.deadlock_detect_enabled {
+                let tid_idx = unsafe { (*processor).get_thread(current_proc.pid) }
+                    .and_then(|tids| tids.iter().position(|&t| t == tid))
+                    .unwrap_or(0);
+                current_proc.ensure_sem_matrix(tid_idx, sem_id, 0);
+                if current_proc.sem_allocation[tid_idx][sem_id] > 0 {
+                    current_proc.sem_allocation[tid_idx][sem_id] -= 1;
+                    current_proc.sem_available[sem_id] += 1;
+                }
+            }
             let sem = Arc::clone(current_proc.semaphore_list[sem_id].as_ref().unwrap());
-            if let Some(tid) = sem.up() {
-                unsafe { (*processor).re_enque(tid); }
+            if let Some(woken_tid) = sem.up() {
+                // 被唤醒的线程获得了资源，更新其分配矩阵
+                if current_proc.deadlock_detect_enabled {
+                    let woken_idx = unsafe { (*processor).get_thread(current_proc.pid) }
+                        .and_then(|tids| tids.iter().position(|&t| t == woken_tid))
+                        .unwrap_or(0);
+                    current_proc.ensure_sem_matrix(woken_idx, sem_id, 0);
+                    if current_proc.sem_available[sem_id] > 0 {
+                        current_proc.sem_available[sem_id] -= 1;
+                        current_proc.sem_allocation[woken_idx][sem_id] += 1;
+                        if current_proc.sem_need[woken_idx][sem_id] > 0 {
+                            current_proc.sem_need[woken_idx][sem_id] -= 1;
+                        }
+                    }
+                }
+                unsafe { (*processor).re_enque(woken_tid); }
             }
             0
         }
@@ -749,6 +782,60 @@ mod impls {
             let current = unsafe { (*processor).current().unwrap() };
             let tid = current.tid;
             let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
+
+            if current_proc.deadlock_detect_enabled {
+                let tid_idx = unsafe { (*processor).get_thread(current_proc.pid) }
+                    .and_then(|tids| tids.iter().position(|&t| t == tid))
+                    .unwrap_or(0);
+                let n_threads = unsafe { (*processor).get_thread(current_proc.pid) }
+                    .map(|v| v.len()).unwrap_or(1);
+                current_proc.ensure_sem_matrix(tid_idx, sem_id, 0);
+                // 确保所有线程行都存在
+                for i in 0..n_threads {
+                    current_proc.ensure_sem_matrix(i, sem_id, 0);
+                }
+                // 模拟分配：Need[tid_idx][sem_id] += 1，然后检查安全性
+                current_proc.sem_need[tid_idx][sem_id] += 1;
+                // 尝试分配：Available[sem_id] -= 1，Allocation[tid_idx][sem_id] += 1
+                if current_proc.sem_available[sem_id] > 0 {
+                    current_proc.sem_available[sem_id] -= 1;
+                    current_proc.sem_allocation[tid_idx][sem_id] += 1;
+                    current_proc.sem_need[tid_idx][sem_id] -= 1;
+                    // 检查安全性
+                    let safe = crate::process::Process::banker_check(
+                        &current_proc.sem_available,
+                        &current_proc.sem_allocation,
+                        &current_proc.sem_need,
+                    );
+                    if !safe {
+                        // 回滚
+                        current_proc.sem_available[sem_id] += 1;
+                        current_proc.sem_allocation[tid_idx][sem_id] -= 1;
+                        current_proc.sem_need[tid_idx][sem_id] += 1;
+                        return -0xDEAD;
+                    }
+                    // 安全，直接获取（不走 sem.down 阻塞路径）
+                    let sem = Arc::clone(current_proc.semaphore_list[sem_id].as_ref().unwrap());
+                    sem.down(tid); // 消耗一个计数（已在 available 里扣除）
+                    return 0;
+                } else {
+                    // 资源不足，检查等待后是否安全
+                    let safe = crate::process::Process::banker_check(
+                        &current_proc.sem_available,
+                        &current_proc.sem_allocation,
+                        &current_proc.sem_need,
+                    );
+                    if !safe {
+                        current_proc.sem_need[tid_idx][sem_id] -= 1;
+                        return -0xDEAD;
+                    }
+                    // 安全，正常阻塞等待
+                    let sem = Arc::clone(current_proc.semaphore_list[sem_id].as_ref().unwrap());
+                    if !sem.down(tid) { return -1; }
+                    return 0;
+                }
+            }
+
             let sem = Arc::clone(current_proc.semaphore_list[sem_id].as_ref().unwrap());
             if !sem.down(tid) { -1 } else { 0 }
         }
@@ -759,24 +846,56 @@ mod impls {
                 Some(Arc::new(MutexBlocking::new()))
             } else { None };
             let current_proc = PROCESSOR.get_mut().get_current_proc().unwrap();
-            if let Some(id) = current_proc.mutex_list.iter().enumerate()
+            let id = if let Some(id) = current_proc.mutex_list.iter().enumerate()
                 .find(|(_, item)| item.is_none()).map(|(id, _)| id)
             {
                 current_proc.mutex_list[id] = new_mutex;
-                id as isize
+                id
             } else {
                 current_proc.mutex_list.push(new_mutex);
-                current_proc.mutex_list.len() as isize - 1
+                current_proc.mutex_list.len() - 1
+            };
+            // 同步银行家算法 available 向量（每个 mutex 1 个资源）
+            while current_proc.mutex_available.len() <= id {
+                current_proc.mutex_available.push(1);
             }
+            current_proc.mutex_available[id] = 1;
+            id as isize
         }
 
         /// 解锁，唤醒等待线程
         fn mutex_unlock(&self, _caller: Caller, mutex_id: usize) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
+            let current = unsafe { (*processor).current().unwrap() };
+            let tid = current.tid;
             let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
+            // 更新银行家算法：释放资源
+            if current_proc.deadlock_detect_enabled {
+                let tid_idx = unsafe { (*processor).get_thread(current_proc.pid) }
+                    .and_then(|tids| tids.iter().position(|&t| t == tid))
+                    .unwrap_or(0);
+                current_proc.ensure_mutex_matrix(tid_idx, mutex_id);
+                if current_proc.mutex_allocation[tid_idx][mutex_id] > 0 {
+                    current_proc.mutex_allocation[tid_idx][mutex_id] -= 1;
+                    current_proc.mutex_available[mutex_id] += 1;
+                }
+            }
             let mutex = Arc::clone(current_proc.mutex_list[mutex_id].as_ref().unwrap());
-            if let Some(tid) = mutex.unlock() {
-                unsafe { (*processor).re_enque(tid); }
+            if let Some(woken_tid) = mutex.unlock() {
+                if current_proc.deadlock_detect_enabled {
+                    let woken_idx = unsafe { (*processor).get_thread(current_proc.pid) }
+                        .and_then(|tids| tids.iter().position(|&t| t == woken_tid))
+                        .unwrap_or(0);
+                    current_proc.ensure_mutex_matrix(woken_idx, mutex_id);
+                    if current_proc.mutex_available[mutex_id] > 0 {
+                        current_proc.mutex_available[mutex_id] -= 1;
+                        current_proc.mutex_allocation[woken_idx][mutex_id] += 1;
+                        if current_proc.mutex_need[woken_idx][mutex_id] > 0 {
+                            current_proc.mutex_need[woken_idx][mutex_id] -= 1;
+                        }
+                    }
+                }
+                unsafe { (*processor).re_enque(woken_tid); }
             }
             0
         }
@@ -787,6 +906,54 @@ mod impls {
             let current = unsafe { (*processor).current().unwrap() };
             let tid = current.tid;
             let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
+
+            if current_proc.deadlock_detect_enabled {
+                let tid_idx = unsafe { (*processor).get_thread(current_proc.pid) }
+                    .and_then(|tids| tids.iter().position(|&t| t == tid))
+                    .unwrap_or(0);
+                let n_threads = unsafe { (*processor).get_thread(current_proc.pid) }
+                    .map(|v| v.len()).unwrap_or(1);
+                current_proc.ensure_mutex_matrix(tid_idx, mutex_id);
+                for i in 0..n_threads {
+                    current_proc.ensure_mutex_matrix(i, mutex_id);
+                }
+                // 模拟请求
+                current_proc.mutex_need[tid_idx][mutex_id] += 1;
+                if current_proc.mutex_available[mutex_id] > 0 {
+                    current_proc.mutex_available[mutex_id] -= 1;
+                    current_proc.mutex_allocation[tid_idx][mutex_id] += 1;
+                    current_proc.mutex_need[tid_idx][mutex_id] -= 1;
+                    let safe = crate::process::Process::banker_check(
+                        &current_proc.mutex_available,
+                        &current_proc.mutex_allocation,
+                        &current_proc.mutex_need,
+                    );
+                    if !safe {
+                        // 回滚
+                        current_proc.mutex_available[mutex_id] += 1;
+                        current_proc.mutex_allocation[tid_idx][mutex_id] -= 1;
+                        current_proc.mutex_need[tid_idx][mutex_id] += 1;
+                        return -0xDEAD;
+                    }
+                    let mutex = Arc::clone(current_proc.mutex_list[mutex_id].as_ref().unwrap());
+                    mutex.lock(tid);
+                    return 0;
+                } else {
+                    let safe = crate::process::Process::banker_check(
+                        &current_proc.mutex_available,
+                        &current_proc.mutex_allocation,
+                        &current_proc.mutex_need,
+                    );
+                    if !safe {
+                        current_proc.mutex_need[tid_idx][mutex_id] -= 1;
+                        return -0xDEAD;
+                    }
+                    let mutex = Arc::clone(current_proc.mutex_list[mutex_id].as_ref().unwrap());
+                    if !mutex.lock(tid) { return -1; }
+                    return 0;
+                }
+            }
+
             let mutex = Arc::clone(current_proc.mutex_list[mutex_id].as_ref().unwrap());
             if !mutex.lock(tid) { -1 } else { 0 }
         }
@@ -832,10 +999,21 @@ mod impls {
             if !flag { -1 } else { 0 }
         }
 
-        /// 死锁检测（TODO 练习题）
+        /// 死锁检测开关
         fn enable_deadlock_detect(&self, _caller: Caller, is_enable: i32) -> isize {
-            tg_console::log::info!("enable_deadlock_detect: is_enable = {is_enable}, not implemented");
-            -1
+            match is_enable {
+                0 => {
+                    let current_proc = PROCESSOR.get_mut().get_current_proc().unwrap();
+                    current_proc.deadlock_detect_enabled = false;
+                    0
+                }
+                1 => {
+                    let current_proc = PROCESSOR.get_mut().get_current_proc().unwrap();
+                    current_proc.deadlock_detect_enabled = true;
+                    0
+                }
+                _ => -1,
+            }
         }
     }
 }
